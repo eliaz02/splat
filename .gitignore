@@ -1,2 +1,4 @@
 .DS_Store
-
+scene/
+*.splat
+*:Zone.Identifier

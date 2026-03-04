@@ -169,6 +169,12 @@ function getProjectionMatrix(fx, fy, width, height) {
 }
 
 function getViewMatrix(camera) {
+    if (!camera) return [
+        1, 0, 0, 0,
+        0, 1, 0, 0,
+        0, 0, 1, 0,
+        0, 0, 0, 1
+    ]; // Identity matrix backup
     const R = camera.rotation.flat();
     const t = camera.position;
     const camToWorld = [
@@ -249,6 +255,57 @@ function invert4(a) {
         (a[13] * b01 - a[12] * b03 - a[14] * b00) / det,
         (a[8] * b03 - a[9] * b01 + a[10] * b00) / det,
     ];
+}
+
+function quaternionToRotationMatrix(q) {
+    const w = q[0], x = q[1], y = q[2], z = q[3];
+    const x2 = x * x, y2 = y * y, z2 = z * z;
+    const wx = w * x, wy = w * y, wz = w * z;
+    const xy = x * y, xz = x * z, yz = y * z;
+
+    // Column-major 4x4 matrix
+    return [
+        1 - 2 * (y2 + z2), 2 * (xy + wz), 2 * (xz - wy), 0,
+        2 * (xy - wz), 1 - 2 * (x2 + z2), 2 * (yz + wx), 0,
+        2 * (xz + wy), 2 * (yz - wx), 1 - 2 * (x2 + y2), 0,
+        0, 0, 0, 1
+    ];
+}
+
+function multiplyQuaternions(a, b) {
+    // a * b
+    const w1 = a[0], x1 = a[1], y1 = a[2], z1 = a[3];
+    const w2 = b[0], x2 = b[1], y2 = b[2], z2 = b[3];
+    return [
+        w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+        w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+        w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+        w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2
+    ];
+}
+
+function eulerToQuaternion(x, y, z) {
+    // Order XYZ
+    const c1 = Math.cos(x / 2);
+    const c2 = Math.cos(y / 2);
+    const c3 = Math.cos(z / 2);
+    const s1 = Math.sin(x / 2);
+    const s2 = Math.sin(y / 2);
+    const s3 = Math.sin(z / 2);
+
+    const qx = [c1, s1, 0, 0];
+    const qy = [c2, 0, s2, 0];
+    const qz = [c3, 0, 0, s3];
+
+    // Y * X * Z (PlayCanvas ZXY?) -> Actually Ref code used setFromEulerAngles(-angleY, angleX, 0)
+    // We want the resulting quaternion to be qY * qX * qZ ?
+    // PlayCanvas Quat setFromEulerAngles:
+    // "Rotates the quaternion by x, y, z ... in the order Z, X, Y"
+    // So Rot = RotY * RotX * RotZ
+    // So:
+    let ret = multiplyQuaternions(qx, qz);
+    ret = multiplyQuaternions(qy, ret);
+    return ret;
 }
 
 function rotate4(a, rad, x, y, z) {
@@ -346,7 +403,7 @@ function createWorker(self) {
     }
 
     function generateTexture() {
-        if (!buffer) return;
+        if (!buffer) return; //  buffer = ArrayBuffer(rowLength * vertexCount);
         const f_buffer = new Float32Array(buffer);
         const u_buffer = new Uint8Array(buffer);
 
@@ -425,15 +482,15 @@ function createWorker(self) {
                 lastProj[2] * viewProj[2] +
                 lastProj[6] * viewProj[6] +
                 lastProj[10] * viewProj[10];
-            if (Math.abs(dot - 1) < 0.01) {
-                return;
-            }
+            // if (Math.abs(dot - 1) < 0.01) {
+            //     return;
+            // }
         } else {
             generateTexture();
             lastVertexCount = vertexCount;
         }
 
-        console.time("sort");
+        //console.time("sort");
         let maxDepth = -Infinity;
         let minDepth = Infinity;
         let sizeList = new Int32Array(vertexCount);
@@ -463,7 +520,7 @@ function createWorker(self) {
         for (let i = 0; i < vertexCount; i++)
             depthIndex[starts0[sizeList[i]]++] = i;
 
-        console.timeEnd("sort");
+        //console.timeEnd("sort");
 
         lastProj = viewProj;
         self.postMessage({ depthIndex, viewProj, vertexCount }, [
@@ -570,9 +627,9 @@ function createWorker(self) {
             if (types["scale_0"]) {
                 const qlen = Math.sqrt(
                     attrs.rot_0 ** 2 +
-                        attrs.rot_1 ** 2 +
-                        attrs.rot_2 ** 2 +
-                        attrs.rot_3 ** 2,
+                    attrs.rot_1 ** 2 +
+                    attrs.rot_2 ** 2 +
+                    attrs.rot_3 ** 2,
                 );
 
                 rot[0] = (attrs.rot_0 / qlen) * 128 + 128;
@@ -634,7 +691,7 @@ function createWorker(self) {
 
     let sortRunning;
     self.onmessage = (e) => {
-        if (e.data.ply) {
+        if (e.data.ply) { // processing the file if in ply fomat 
             vertexCount = 0;
             runSort(viewProj);
             buffer = processPlyBuffer(e.data.ply);
@@ -731,24 +788,361 @@ void main () {
 
 `.trim();
 
+const skyboxVertexShaderSource = `
+#version 300 es
+layout(location = 0) in vec2 position;
+out vec3 vTexCoord;
+uniform mat4 u_viewDirectionProjectionInverse;
+
+void main() {
+    // Z = 1.0 (maximum depth)
+    vec4 t = u_viewDirectionProjectionInverse * vec4(position, 1.0, 1.0);
+    vTexCoord = normalize(t.xyz / t.w);
+    gl_Position = vec4(position, 1.0, 1.0);
+}`.trim();
+
+const skyboxFragmentShaderSource = `
+#version 300 es
+precision highp float;
+in vec3 vTexCoord;
+uniform samplerCube u_skybox;
+out vec4 outColor;
+
+void main() {
+    outColor = texture(u_skybox, vTexCoord); 
+}`.trim();
+
+function createCubemapTexture(gl, images) {
+    const texture = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_CUBE_MAP, texture);
+
+    // Map filenames to cubemap targets
+    const orderMap = {
+        "right.png": gl.TEXTURE_CUBE_MAP_POSITIVE_X,
+        "left.png": gl.TEXTURE_CUBE_MAP_NEGATIVE_X,
+        "top.png": gl.TEXTURE_CUBE_MAP_POSITIVE_Y, // Corrected: Top should be +Y
+        "bottom.png": gl.TEXTURE_CUBE_MAP_NEGATIVE_Y, // Corrected: Bottom should be -Y
+        "front.png": gl.TEXTURE_CUBE_MAP_POSITIVE_Z,
+        "back.png": gl.TEXTURE_CUBE_MAP_NEGATIVE_Z
+    };
+
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true); // Fix: required for correct orientation
+
+    // Load each image to its corresponding face
+    images.forEach((img, index) => {
+        const filename = requiredPngs[index];
+        const target = orderMap[filename];
+        if (target) {
+            gl.texImage2D(target, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
+        }
+    });
+
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false); // Reset to default
+
+    // Set texture parameters
+    gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_WRAP_R, gl.CLAMP_TO_EDGE);
+
+    return texture;
+}
+
 let defaultViewMatrix = [
     0.47, 0.04, 0.88, 0, -0.11, 0.99, 0.02, 0, -0.88, -0.11, 0.47, 0, 0.07,
     0.03, 6.55, 1,
 ];
 let viewMatrix = defaultViewMatrix;
+
+const requiredPngs = [
+    "front.png",
+    "back.png",
+    "right.png",
+    "left.png",
+    "top.png",
+    "bottom.png",
+];
+
+// Load cubemap images
+async function loadCubemap(urls) {
+    try {
+        const images = await Promise.all(
+            urls.map(url => {
+                return new Promise((resolve, reject) => {
+                    const img = new Image();
+                    img.onload = () => resolve(img);
+                    img.onerror = () => reject(new Error(`Failed to load ${url}`));
+                    img.src = url;
+                });
+            })
+        );
+
+        console.log("All cubemap images loaded successfully");
+        return images; // Array of 6 Image objects
+
+    } catch (error) {
+        console.error("Error loading cubemap:", error);
+        return null;
+    }
+}
+
+
 async function main() {
+    // Screenshot Sequence State
+    const screenshotState = {
+        active: false,
+        index: 0,
+        data: [],
+        zip: null,
+        waitingForSort: false,
+        currentViewProj: null
+    };
+
+    async function initiateScreenshotSequence() {
+        if (screenshotState.active) return;
+
+        try {
+            console.log("Loading image_data.json...");
+            const response = await fetch(`scene/fists/image_data_gif.json?t=${Date.now()}`);
+            if (!response.ok) throw new Error("Failed to load image_data.json");
+            const data = await response.json();
+
+            screenshotState.active = true;
+            screenshotState.index = 0;
+            screenshotState.data = data;
+            screenshotState.zip = new JSZip();
+            screenshotState.waitingForSort = false;
+
+            console.log("Starting screenshot sequence, frames: " + data.length);
+            processNextFrame();
+
+        } catch (e) {
+            console.error("Failed to start screenshot sequence:", e);
+            screenshotState.active = false;
+        }
+    }
+
+    function processNextFrame() {
+        if (screenshotState.index >= screenshotState.data.length) {
+            finishScreenshotSequence();
+            return;
+        }
+
+        const item = screenshotState.data[screenshotState.index];
+
+        gl.useProgram(program); // Fix: Ensure program is active for all uniforms (viewport, focal, proj)
+
+        // 1. Resolution Setup
+        const width = item.output_width || 1600;
+        const height = item.output_height || 900;
+
+        if (canvas.width !== width || canvas.height !== height) {
+            canvas.width = width;
+            canvas.height = height;
+            gl.viewport(0, 0, width, height);
+            gl.uniform2fv(u_viewport, new Float32Array([width, height]));
+        }
+
+        // 2. Projection Matrix
+        const srcW = item.source_width || width;
+        const srcH = item.source_height || height;
+        const scaleX = width / srcW;
+        const scaleY = height / srcH;
+
+        // Use provided fx/fy or fallback
+        let fx = item.fx;
+        let fy = item.fy;
+        if (!fx || !fy) {
+            const fovXRad = (item.fov_x * Math.PI) / 180.0;
+            const fovYRad = (item.fov_y * Math.PI) / 180.0;
+            fx = (srcW / 2.0) / Math.tan(fovXRad / 2.0);
+            fy = (srcH / 2.0) / Math.tan(fovYRad / 2.0);
+        }
+
+        const fx_scaled = fx * scaleX;
+        const fy_scaled = fy * scaleY;
+
+        gl.useProgram(program); // Fix: Ensure program is active before setting uniforms
+        gl.uniform2fv(u_focal, new Float32Array([fx_scaled, fy_scaled]));
+
+        // Recalculate Projection
+        projectionMatrix = getProjectionMatrix(fx_scaled, fy_scaled, width, height);
+        gl.uniformMatrix4fv(u_projection, false, projectionMatrix);
+
+        // 3. View Matrix (Rotation & Position)
+        // Convert quaternion [w,x,y,z] to 3x3 rotation matrix (row-major, like cameras array)
+        const q = item.rotation;
+        const w = q[0], x = q[1], y = q[2], z = q[3];
+
+        const R = [
+            1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y),
+            2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x),
+            2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)
+        ];
+
+        const t = item.position;
+
+        // Build view matrix exactly like getViewMatrix does
+        viewMatrix = [
+            R[0], R[1], R[2], 0,
+            R[3], R[4], R[5], 0,
+            R[6], R[7], R[8], 0,
+            -t[0] * R[0] - t[1] * R[3] - t[2] * R[6],
+            -t[0] * R[1] - t[1] * R[4] - t[2] * R[7],
+            -t[0] * R[2] - t[1] * R[5] - t[2] * R[8],
+            1,
+        ];
+
+        // 4. Trigger Sort
+        const actualViewMatrix = viewMatrix; // No jump delta in screenshot mode usually
+        const viewProj = multiply4(projectionMatrix, actualViewMatrix);
+
+        // Store expecting viewProj to check against
+        screenshotState.currentViewProj = viewProj;
+        screenshotState.waitingForSort = true;
+
+        // Send to worker
+        worker.postMessage({ view: viewProj });
+
+        // Force render immediately (handled in loop, but we need to ensure loop is running)
+        // carosel = false already handled globally? 
+        // We might need to ensure `carousel` is false.
+    }
+
+    function finishScreenshotSequence() {
+        console.log("Screenshot sequence finished. Generating zip...");
+        screenshotState.active = false;
+        screenshotState.data = null;
+
+        screenshotState.zip.generateAsync({ type: "blob" }).then(function (content) {
+            const link = document.createElement("a");
+            link.href = URL.createObjectURL(content);
+            link.download = "colmap_final.zip";
+            link.click();
+        });
+    }
+
+    function captureFrame() {
+        console.log(`Capturing frame ${screenshotState.index + 1}/${screenshotState.data.length}`);
+
+        // Draw scene (should be triggered by frame() loop after sort is done)
+        // Verify we are ready? The `worker.onmessage` calls this AFTER `depthIndex` update.
+        // So `frame()` should have run at least once with new sorted index?
+        // Actually, `depthIndex` message updates `indexBuffer` immediately.
+        // We just need to ensure `gl.drawArrays` is called before readPixels.
+        // Call `frame(Date.now())` to force a draw?
+
+        // Force a draw to ensure the buffer is clear and everything is drawn with new data
+        // We reuse the existing `frame` function logic but we can also just run the draw commands manually
+        // OR rely on the fact that we just updated the index buffer and `requestAnimationFrame` is loopin.
+
+        // Issue: `frame()` runs on RAF. We are inside `worker.onmessage`.
+        // We should force a synchronous draw or wait for next RAF?
+        // Let's force a draw here to be safe and synchronous.
+
+        // Set up gl state for draw
+        gl.clear(gl.COLOR_BUFFER_BIT);
+        gl.useProgram(program);
+        gl.activeTexture(gl.TEXTURE0);
+        gl.bindTexture(gl.TEXTURE_2D, texture);
+        gl.uniformMatrix4fv(u_view, false, viewMatrix); // Ensure uniform is set
+        gl.uniformMatrix4fv(u_projection, false, projectionMatrix);
+        gl.bindVertexArray(VAO);
+        gl.drawArraysInstanced(gl.TRIANGLE_FAN, 0, 4, vertexCount);
+
+        // Render Skybox if needed
+        if (cubemapTexture) {
+            gl.useProgram(programSkybox);
+            gl.depthMask(false);
+            let viewNoTranslation = [...viewMatrix];
+            viewNoTranslation[12] = 0; viewNoTranslation[13] = 0; viewNoTranslation[14] = 0;
+            let viewDirectionProj = multiply4(projectionMatrix, viewNoTranslation);
+            let viewDirectionProjInv = invert4(viewDirectionProj);
+            gl.uniformMatrix4fv(u_VDPI, false, viewDirectionProjInv);
+            gl.activeTexture(gl.TEXTURE1);
+            gl.bindTexture(gl.TEXTURE_CUBE_MAP, cubemapTexture);
+            gl.uniform1i(u_skyboxLocation, 1);
+            gl.bindVertexArray(skyboxVAO);
+            gl.drawArrays(gl.TRIANGLES, 0, 6);
+        }
+
+        // Read Pixels
+        const width = canvas.width;
+        const height = canvas.height;
+        const pixels = new Uint8Array(width * height * 4);
+        gl.readPixels(0, 0, width, height, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+
+        // Flip Y manually (WebGL reads upside down relative to image format usually? No, gl.readPixels is bottom-left)
+        // PNG expects top-left. So we flip Y.
+
+        const flippedPixels = new Uint8Array(width * height * 4);
+        for (let y = 0; y < height; y++) {
+            for (let x = 0; x < width; x++) {
+                const srcOp = (y * width + x) * 4;
+                const dstOp = ((height - 1 - y) * width + x) * 4;
+                flippedPixels[dstOp] = pixels[srcOp];
+                flippedPixels[dstOp + 1] = pixels[srcOp + 1];
+                flippedPixels[dstOp + 2] = pixels[srcOp + 2];
+                flippedPixels[dstOp + 3] = pixels[srcOp + 3];
+            }
+        }
+
+        // Create Canvas to convert to Base64 (or use other method)
+        // Using a temporary canvas is easiest for PNG encoding
+        const tempCanvas = document.createElement('canvas');
+        tempCanvas.width = width;
+        tempCanvas.height = height;
+        const ctx = tempCanvas.getContext('2d');
+        const imageData = ctx.createImageData(width, height);
+        imageData.data.set(flippedPixels);
+        ctx.putImageData(imageData, 0, 0);
+
+        const item = screenshotState.data[screenshotState.index];
+        let name = item.name || `frame_${screenshotState.index.toString().padStart(5, '0')}.png`;
+        if (!name.endsWith('.png')) name += '.png';
+
+        const dataUrl = tempCanvas.toDataURL('image/png');
+        const base64 = dataUrl.split(',')[1];
+
+        screenshotState.zip.file(name, base64, { base64: true });
+
+        screenshotState.index++;
+        processNextFrame();
+    }
+
     let carousel = true;
     const params = new URLSearchParams(location.search);
     try {
         viewMatrix = JSON.parse(decodeURIComponent(location.hash.slice(1)));
         carousel = false;
-    } catch (err) {}
+    } catch (err) { }
+
+    // load cubeMap
+    const cubemapBase = new URL(
+        (params.get("cubemap") || `scene/fists/skybox2/?t=${Date.now()}`).replace(/\/?$/, '/'),
+        location.href
+    );
+
+    const cubemapUrls = requiredPngs.map(filename =>
+        new URL(filename, cubemapBase).href
+    );
+
+    let images = loadCubemap(cubemapUrls);
+    let cubemapTexture = null;
+
+    // load camera position
+
+
+    // load point cloud (3DGS)
     const url = new URL(
         // "nike.splat",
         // location.href,
-        params.get("url") || "train.splat",
-        "https://huggingface.co/cakewalk/splat-data/resolve/main/",
+        params.get("url") || "fists/point_by_hand.splat",
+        location.href + "scene/",
     );
+
+    // file reading 
     const req = await fetch(url, {
         mode: "cors", // no-cors, *cors, same-origin
         credentials: "omit", // include, *same-origin, omit
@@ -757,17 +1151,22 @@ async function main() {
     if (req.status != 200)
         throw new Error(req.status + " Unable to load " + req.url);
 
+    /*  Position (XYZ): 3 floats x 4 bytes = 12 bytes.
+    *   Scale (XYZ): 3 floats x 4 bytes = 12 bytes.
+    *   Color (RGBA): 4 uint8 = 4 bytes.
+    *   Rotation (Quat): 4 uint8 (packed) = 4 bytes.*/
     const rowLength = 3 * 4 + 3 * 4 + 4 + 4;
-    const reader = req.body.getReader();
+    const reader = req.body.getReader(); // Allows reading data in chunks as it arrives (streaming)
     let splatData = new Uint8Array(req.headers.get("content-length"));
 
-    const downsample =
-        splatData.length / rowLength > 500000 ? 1 : 1 / devicePixelRatio;
+    const downsample = splatData.length / rowLength > 500000 ? 1 : 1 / devicePixelRatio;
     console.log(splatData.length / rowLength, downsample);
 
+
+    // code for generate a worker that will process the sorting of the point, and process ply format file if need  
     const worker = new Worker(
         URL.createObjectURL(
-            new Blob(["(", createWorker.toString(), ")(self)"], {
+            new Blob(["(", createWorker.toString(), ")(self)"], { // trick to avoid the creation of different files 
                 type: "application/javascript",
             }),
         ),
@@ -783,6 +1182,15 @@ async function main() {
         antialias: false,
     });
 
+
+    // Handle the Promise returned by loadCubemap
+    images.then((imgs) => {
+        cubemapTexture = createCubemapTexture(gl, imgs);
+    }).catch(err => console.error("Skybox failed to load", err));
+
+    console.log(cubemapTexture);
+
+    // --- generate WebGL for 3DGS: Shader program, Binding, Blending, VAO
     const vertexShader = gl.createShader(gl.VERTEX_SHADER);
     gl.shaderSource(vertexShader, vertexShaderSource);
     gl.compileShader(vertexShader);
@@ -821,6 +1229,9 @@ async function main() {
     const u_focal = gl.getUniformLocation(program, "focal");
     const u_view = gl.getUniformLocation(program, "view");
 
+    const VAO = gl.createVertexArray();
+    gl.bindVertexArray(VAO);
+
     // positions
     const triangleVertices = new Float32Array([-2, -2, 2, -2, 2, 2, -2, 2]);
     const vertexBuffer = gl.createBuffer();
@@ -844,7 +1255,59 @@ async function main() {
     gl.vertexAttribIPointer(a_index, 1, gl.INT, false, 0, 0);
     gl.vertexAttribDivisor(a_index, 1);
 
+
+    // generate WebGL for Skybox: Shader program, Binding, Blending, VAO 
+    const vertexShaderSkybox = gl.createShader(gl.VERTEX_SHADER);
+    gl.shaderSource(vertexShaderSkybox, skyboxVertexShaderSource);
+    gl.compileShader(vertexShaderSkybox);
+    if (!gl.getShaderParameter(vertexShaderSkybox, gl.COMPILE_STATUS))
+        console.error(gl.getShaderInfoLog(vertexShaderSkybox));
+
+    const fragmentShaderSkybox = gl.createShader(gl.FRAGMENT_SHADER);
+    gl.shaderSource(fragmentShaderSkybox, skyboxFragmentShaderSource);
+    gl.compileShader(fragmentShaderSkybox);
+    if (!gl.getShaderParameter(fragmentShaderSkybox, gl.COMPILE_STATUS))
+        console.error(gl.getShaderInfoLog(fragmentShaderSkybox));
+
+    const programSkybox = gl.createProgram();
+    gl.attachShader(programSkybox, vertexShaderSkybox);
+    gl.attachShader(programSkybox, fragmentShaderSkybox);
+    gl.linkProgram(programSkybox);
+    gl.useProgram(programSkybox);
+
+    if (!gl.getProgramParameter(programSkybox, gl.LINK_STATUS))
+        console.error(gl.getProgramInfoLog(program));
+
+    // stand for unimform view*Direction*Projection Inverse
+    const u_VDPI = gl.getUniformLocation(programSkybox, "u_viewDirectionProjectionInverse");
+    const u_skyboxLocation = gl.getUniformLocation(programSkybox, "u_skybox");
+
+    const quadPositions = new Float32Array([
+        -1, -1,
+        1, -1,
+        -1, 1,
+        -1, 1,
+        1, -1,
+        1, 1,
+    ]);
+
+    const skyboxVAO = gl.createVertexArray();
+    gl.bindVertexArray(skyboxVAO);
+
+    const positionBuffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, quadPositions, gl.STATIC_DRAW);
+
+    gl.enableVertexAttribArray(0);
+    gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+
+    gl.bindVertexArray(null);
+
     const resize = () => {
+        // Force the splat program to be active before setting its uniforms
+        gl.useProgram(program);
+
+        if (!camera) return; // Fix: Prevent crash if camera is not initialized
         gl.uniform2fv(u_focal, new Float32Array([camera.fx, camera.fy]));
 
         projectionMatrix = getProjectionMatrix(
@@ -863,6 +1326,9 @@ async function main() {
         gl.uniformMatrix4fv(u_projection, false, projectionMatrix);
     };
 
+
+
+    // handling of windows resizing 
     window.addEventListener("resize", resize);
     resize();
 
@@ -879,47 +1345,70 @@ async function main() {
                 document.body.appendChild(link);
                 link.click();
             }
-        } else if (e.data.texdata) {
-            const { texdata, texwidth, texheight } = e.data;
-            // console.log(texdata)
-            gl.bindTexture(gl.TEXTURE_2D, texture);
-            gl.texParameteri(
-                gl.TEXTURE_2D,
-                gl.TEXTURE_WRAP_S,
-                gl.CLAMP_TO_EDGE,
-            );
-            gl.texParameteri(
-                gl.TEXTURE_2D,
-                gl.TEXTURE_WRAP_T,
-                gl.CLAMP_TO_EDGE,
-            );
-            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+        } else
+            if (e.data.texdata) {
+                const { texdata, texwidth, texheight } = e.data;
+                // console.log(texdata)
+                gl.bindTexture(gl.TEXTURE_2D, texture);
+                gl.texParameteri(
+                    gl.TEXTURE_2D,
+                    gl.TEXTURE_WRAP_S,
+                    gl.CLAMP_TO_EDGE,
+                );
+                gl.texParameteri(
+                    gl.TEXTURE_2D,
+                    gl.TEXTURE_WRAP_T,
+                    gl.CLAMP_TO_EDGE,
+                );
+                gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+                gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
 
-            gl.texImage2D(
-                gl.TEXTURE_2D,
-                0,
-                gl.RGBA32UI,
-                texwidth,
-                texheight,
-                0,
-                gl.RGBA_INTEGER,
-                gl.UNSIGNED_INT,
-                texdata,
-            );
-            gl.activeTexture(gl.TEXTURE0);
-            gl.bindTexture(gl.TEXTURE_2D, texture);
-        } else if (e.data.depthIndex) {
-            const { depthIndex, viewProj } = e.data;
-            gl.bindBuffer(gl.ARRAY_BUFFER, indexBuffer);
-            gl.bufferData(gl.ARRAY_BUFFER, depthIndex, gl.DYNAMIC_DRAW);
-            vertexCount = e.data.vertexCount;
-        }
+                gl.texImage2D(
+                    gl.TEXTURE_2D,
+                    0,
+                    gl.RGBA32UI,
+                    texwidth,
+                    texheight,
+                    0,
+                    gl.RGBA_INTEGER,
+                    gl.UNSIGNED_INT,
+                    texdata,
+                );
+                gl.activeTexture(gl.TEXTURE0);
+                gl.bindTexture(gl.TEXTURE_2D, texture);
+            } else
+                if (e.data.depthIndex) {
+                    const { depthIndex, viewProj } = e.data;
+                    gl.bindBuffer(gl.ARRAY_BUFFER, indexBuffer);
+                    gl.bufferData(gl.ARRAY_BUFFER, depthIndex, gl.DYNAMIC_DRAW);
+                    vertexCount = e.data.vertexCount;
+
+                    // Screenshot Wait Logic
+                    if (screenshotState.active && screenshotState.waitingForSort) {
+                        // Check if this sort result matches the requested view
+                        const current = screenshotState.currentViewProj;
+                        let match = true;
+                        if (current && viewProj) {
+                            for (let i = 0; i < 16; i++) {
+                                if (Math.abs(current[i] - viewProj[i]) > 0.0001) {
+                                    match = false;
+                                    break;
+                                }
+                            }
+                        }
+
+                        if (match) {
+                            screenshotState.waitingForSort = false;
+                            captureFrame();
+                        }
+                    }
+                }
     };
 
     let activeKeys = [];
     let currentCameraIndex = 0;
 
+    // camera process input 
     window.addEventListener("keydown", (e) => {
         // if (document.activeElement != document.body) return;
         carousel = false;
@@ -927,7 +1416,7 @@ async function main() {
         if (/\d/.test(e.key)) {
             currentCameraIndex = parseInt(e.key);
             camera = cameras[currentCameraIndex];
-            viewMatrix = getViewMatrix(camera);
+            if (camera) viewMatrix = getViewMatrix(camera);
         }
         if (["-", "_"].includes(e.key)) {
             currentCameraIndex =
@@ -949,6 +1438,9 @@ async function main() {
         } else if (e.code === "KeyP") {
             carousel = true;
             camid.innerText = "";
+        } else if (e.code === "Space") {
+            // Trigger screenshot sequence
+            initiateScreenshotSequence();
         }
     });
     window.addEventListener("keyup", (e) => {
@@ -968,8 +1460,8 @@ async function main() {
                 e.deltaMode == 1
                     ? lineHeight
                     : e.deltaMode == 2
-                      ? innerHeight
-                      : 1;
+                        ? innerHeight
+                        : 1;
             let inv = invert4(viewMatrix);
             if (e.shiftKey) {
                 inv = translate4(
@@ -1231,24 +1723,24 @@ async function main() {
                 inv = translate4(inv, 0, 0, -moveSpeed * gamepad.axes[1]);
                 carousel = false;
             }
-            if (gamepad.buttons[12].pressed || gamepad.buttons[13].pressed) {
+            if (gamepad.buttons[12]?.pressed || gamepad.buttons[13]?.pressed) {
                 inv = translate4(
                     inv,
                     0,
                     -moveSpeed *
-                        (gamepad.buttons[12].pressed -
-                            gamepad.buttons[13].pressed),
+                    (gamepad.buttons[12].pressed -
+                        gamepad.buttons[13].pressed),
                     0,
                 );
                 carousel = false;
             }
 
-            if (gamepad.buttons[14].pressed || gamepad.buttons[15].pressed) {
+            if (gamepad.buttons[14]?.pressed || gamepad.buttons[15]?.pressed) {
                 inv = translate4(
                     inv,
                     -moveSpeed *
-                        (gamepad.buttons[14].pressed -
-                            gamepad.buttons[15].pressed),
+                    (gamepad.buttons[14].pressed -
+                        gamepad.buttons[15].pressed),
                     0,
                     0,
                 );
@@ -1279,8 +1771,8 @@ async function main() {
             if (gamepad.buttons[5].pressed && !rightGamepadTrigger) {
                 camera =
                     cameras[
-                        (cameras.indexOf(camera) + cameras.length - 1) %
-                            cameras.length
+                    (cameras.indexOf(camera) + cameras.length - 1) %
+                    cameras.length
                     ];
                 inv = invert4(getViewMatrix(camera));
                 carousel = false;
@@ -1306,8 +1798,8 @@ async function main() {
                 activeKeys.includes("KeyJ")
                     ? -0.05
                     : activeKeys.includes("KeyL")
-                      ? 0.05
-                      : 0,
+                        ? 0.05
+                        : 0,
                 0,
                 1,
                 0,
@@ -1317,8 +1809,8 @@ async function main() {
                 activeKeys.includes("KeyI")
                     ? 0.05
                     : activeKeys.includes("KeyK")
-                      ? -0.05
-                      : 0,
+                        ? -0.05
+                        : 0,
                 1,
                 0,
                 0,
@@ -1338,33 +1830,93 @@ async function main() {
             viewMatrix = invert4(inv);
         }
 
+        // jumping check
         if (isJumping) {
             jumpDelta = Math.min(1, jumpDelta + 0.05);
         } else {
             jumpDelta = Math.max(0, jumpDelta - 0.05);
         }
-
+        // jumpin math
         let inv2 = invert4(viewMatrix);
         inv2 = translate4(inv2, 0, -jumpDelta, 0);
         inv2 = rotate4(inv2, -0.1 * jumpDelta, 1, 0, 0);
         let actualViewMatrix = invert4(inv2);
 
+        // update the worker data for the sorting 
         const viewProj = multiply4(projectionMatrix, actualViewMatrix);
         worker.postMessage({ view: viewProj });
 
+        // fps math
         const currentFps = 1000 / (now - lastFrame) || 0;
         avgFps = avgFps * 0.9 + currentFps * 0.1;
 
-        if (vertexCount > 0) {
-            document.getElementById("spinner").style.display = "none";
-            gl.uniformMatrix4fv(u_view, false, actualViewMatrix);
-            gl.clear(gl.COLOR_BUFFER_BIT);
-            gl.drawArraysInstanced(gl.TRIANGLE_FAN, 0, 4, vertexCount);
-        } else {
-            gl.clear(gl.COLOR_BUFFER_BIT);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+
+        if (!(cubemapTexture || vertexCount > 0)) {
             document.getElementById("spinner").style.display = "";
             start = Date.now() + 2000;
         }
+
+
+
+        if (vertexCount > 0) {
+            document.getElementById("spinner").style.display = "none";
+
+            gl.useProgram(program);
+            gl.disable(gl.DEPTH_TEST); // Disable depth testing
+            // Enable blending
+            gl.enable(gl.BLEND);
+            gl.blendFuncSeparate(
+                gl.ONE_MINUS_DST_ALPHA,
+                gl.ONE,
+                gl.ONE_MINUS_DST_ALPHA,
+                gl.ONE,
+            );
+            gl.blendEquationSeparate(gl.FUNC_ADD, gl.FUNC_ADD);
+
+            gl.activeTexture(gl.TEXTURE0);
+            gl.bindTexture(gl.TEXTURE_2D, texture);
+            gl.uniformMatrix4fv(u_view, false, actualViewMatrix);
+
+            gl.bindVertexArray(VAO);
+
+
+            gl.drawArraysInstanced(gl.TRIANGLE_FAN, 0, 4, vertexCount);
+        }
+
+        if (cubemapTexture) {
+            if (!gl.isTexture(cubemapTexture)) {
+                console.error("Invalid cubemap texture!");
+            }
+            document.getElementById("spinner").style.display = "none";
+            gl.useProgram(programSkybox);
+            gl.enable(gl.BLEND);
+            // "SkyboxColor * (1 - SplatAlpha) + ExistingSplatColor"
+            gl.blendFunc(gl.ONE_MINUS_DST_ALPHA, gl.ONE);
+            gl.enable(gl.DEPTH_TEST);
+            gl.depthFunc(gl.LEQUAL)
+            gl.depthMask(false)
+
+            let viewNoTranslation = [...actualViewMatrix];
+            viewNoTranslation[12] = 0;
+            viewNoTranslation[13] = 0;
+            viewNoTranslation[14] = 0;
+
+            // Multiply Projection * View(RotationOnly)
+            let viewDirectionProj = multiply4(projectionMatrix, viewNoTranslation);
+            // Invert to map Clip Space -> World Space
+            let viewDirectionProjInv = invert4(viewDirectionProj);
+
+            gl.uniformMatrix4fv(u_VDPI, false, viewDirectionProjInv);
+            gl.activeTexture(gl.TEXTURE1);
+            gl.bindTexture(gl.TEXTURE_CUBE_MAP, cubemapTexture);
+            gl.uniform1i(u_skyboxLocation, 1);
+
+            // Draw the full-screen quad for the skybox
+            gl.bindVertexArray(skyboxVAO);
+            gl.drawArrays(gl.TRIANGLES, 0, 6);
+        }
+
         const progress = (100 * vertexCount) / (splatData.length / rowLength);
         if (progress < 100) {
             document.getElementById("progress").style.width = progress + "%";
@@ -1428,7 +1980,7 @@ async function main() {
         try {
             viewMatrix = JSON.parse(decodeURIComponent(location.hash.slice(1)));
             carousel = false;
-        } catch (err) {}
+        } catch (err) { }
     });
 
     const preventDefault = (e) => {
@@ -1448,6 +2000,7 @@ async function main() {
     let lastVertexCount = -1;
     let stopLoading = false;
 
+    // chunk loading
     while (true) {
         const { done, value } = await reader.read();
         if (done || stopLoading) break;
